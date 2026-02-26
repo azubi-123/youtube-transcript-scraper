@@ -319,6 +319,7 @@ if "transcript_text" not in st.session_state:
     st.session_state.video_id = None
     st.session_state.extracted_items = None
     st.session_state.personal_lists = None
+    st.session_state.auto_saved = False
 
 st.title("📝 YouTube Transcript Scraper")
 st.write("Extract transcripts from YouTube videos and save them as text files.")
@@ -341,9 +342,10 @@ if st.button("Extract Transcript", type="primary"):
     if not url_input:
         st.error("Please enter a YouTube URL.")
     else:
-        # Reset extraction state when fetching a new transcript
+        # Reset state when fetching a new transcript
         st.session_state.extracted_items = None
         st.session_state.personal_lists = None
+        st.session_state.auto_saved = False
 
         with st.spinner("Extracting transcript..."):
             video_id = extract_video_id(url_input)
@@ -384,10 +386,11 @@ if st.session_state.transcript_text:
         label_visibility="collapsed"
     )
 
-    # Auto-save to file
-    if auto_save:
+    # Auto-save to file (only once per transcript fetch, not on every rerun)
+    if auto_save and not st.session_state.auto_saved:
         try:
             filepath = save_transcript_to_file(video_id, transcript_text)
+            st.session_state.auto_saved = True
             st.success(f"Saved to: `{filepath}`")
         except Exception as e:
             st.warning(f"Could not auto-save: {str(e)}")
