@@ -223,12 +223,102 @@ def save_transcript_to_file(video_id, transcript_text, output_dir='transcripts')
     return filepath
 
 
-# Streamlit UI
+def extract_items_from_transcript(transcript_text, list_name, video_url):
+    """Use Claude Haiku to extract structured items from a transcript."""
+    import anthropic
+
+    # Auto-detect extraction type from list name
+    list_name_lower = list_name.lower()
+    if any(word in list_name_lower for word in ["restaurant", "food", "meal", "eat", "dining"]):
+        extraction_hint = "restaurants and food recommendations"
+        item_hint = "restaurant name, cuisine type, location, specific dishes recommended"
+    elif any(word in list_name_lower for word in ["recipe", "cook", "bake"]):
+        extraction_hint = "recipes"
+        item_hint = "recipe name, key ingredients, brief instructions"
+    elif any(word in list_name_lower for word in ["book", "read"]):
+        extraction_hint = "books"
+        item_hint = "book title, author, why it was recommended"
+    elif any(word in list_name_lower for word in ["movie", "watch", "film", "show"]):
+        extraction_hint = "movies and shows"
+        item_hint = "title, genre, why it was recommended"
+    elif any(word in list_name_lower for word in ["wine", "drink", "beer", "cocktail"]):
+        extraction_hint = "drinks and beverages"
+        item_hint = "drink name, type, tasting notes or pairing suggestions"
+    else:
+        extraction_hint = "notable items, recommendations, or actionable information"
+        item_hint = "item name, relevant details"
+
+    # Truncate transcript to stay within reasonable token limits
+    max_chars = 100000  # ~25K words, covers most videos up to ~2.5 hours
+    truncated = transcript_text[:max_chars]
+    was_truncated = len(transcript_text) > max_chars
+
+    truncation_note = ""
+    if was_truncated:
+        truncation_note = "\nNote: This transcript was truncated. Focus on the content provided."
+
+    prompt = f"""Extract {extraction_hint} from this YouTube video transcript.
+
+Return a JSON array of items. Each item should have:
+- "name": The item name (required)
+- "notes": Additional details ({item_hint})
+
+Only extract items that are clearly mentioned in the transcript. Do not infer or fabricate items.
+If no relevant items are found, return an empty array: []
+{truncation_note}
+Transcript:
+{truncated}
+
+Respond ONLY with the JSON array, no other text."""
+
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    response = client.messages.create(
+        model="claude-3-5-haiku-20241022",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    response_text = response.content[0].text.strip()
+
+    # Handle markdown code blocks (same pattern as url_import_service.py)
+    if response_text.startswith("```"):
+        response_text = response_text.split("```")[1]
+        if response_text.startswith("json"):
+            response_text = response_text[4:]
+        response_text = response_text.strip()
+
+    items = json.loads(response_text)
+
+    # Normalize to {name, notes} and append source URL
+    result = []
+    for item in items:
+        if isinstance(item, dict) and "name" in item:
+            notes = item.get("notes", "")
+            if notes:
+                notes += f"\n\nSource: {video_url}"
+            else:
+                notes = f"Source: {video_url}"
+            result.append({"name": item["name"], "notes": notes})
+        elif isinstance(item, str):
+            result.append({"name": item, "notes": f"Source: {video_url}"})
+
+    return result
+
+
+# --- Streamlit UI ---
+
 st.set_page_config(
     page_title="YouTube Transcript Scraper",
     page_icon="📝",
     layout="centered"
 )
+
+# Initialize session state
+if "transcript_text" not in st.session_state:
+    st.session_state.transcript_text = None
+    st.session_state.video_id = None
+    st.session_state.extracted_items = None
+    st.session_state.personal_lists = None
 
 st.title("📝 YouTube Transcript Scraper")
 st.write("Extract transcripts from YouTube videos and save them as text files.")
@@ -251,59 +341,162 @@ if st.button("Extract Transcript", type="primary"):
     if not url_input:
         st.error("Please enter a YouTube URL.")
     else:
+        # Reset extraction state when fetching a new transcript
+        st.session_state.extracted_items = None
+        st.session_state.personal_lists = None
+
         with st.spinner("Extracting transcript..."):
-            # Extract video ID
             video_id = extract_video_id(url_input)
 
             if not video_id:
                 st.error("Invalid YouTube URL format. Please check the URL and try again.")
             else:
                 st.info(f"Video ID: `{video_id}`")
-
-                # Fetch transcript
                 result = get_transcript(video_id)
 
                 if result['success']:
-                    # Format transcript
                     transcript_text = format_transcript(
                         result['transcript'],
                         include_timestamps=include_timestamps
                     )
-
-                    # Success message
+                    # Store in session state
+                    st.session_state.transcript_text = transcript_text
+                    st.session_state.video_id = video_id
                     st.success(result['message'])
-
-                    # Display stats
-                    word_count = len(transcript_text.split())
-                    st.metric("Word Count", f"{word_count:,}")
-
-                    # Display transcript
-                    st.subheader("Transcript:")
-                    st.text_area(
-                        "Transcript content",
-                        transcript_text,
-                        height=300,
-                        label_visibility="collapsed"
-                    )
-
-                    # Auto-save to file
-                    if auto_save:
-                        try:
-                            filepath = save_transcript_to_file(video_id, transcript_text)
-                            st.success(f"Saved to: `{filepath}`")
-                        except Exception as e:
-                            st.warning(f"Could not auto-save: {str(e)}")
-
-                    # Download button
-                    st.download_button(
-                        label="⬇️ Download as TXT",
-                        data=transcript_text,
-                        file_name=f"{video_id}_transcript.txt",
-                        mime="text/plain"
-                    )
                 else:
-                    # Display error
+                    st.session_state.transcript_text = None
+                    st.session_state.video_id = None
                     st.error(result['error'])
+
+# Display transcript from session state
+if st.session_state.transcript_text:
+    transcript_text = st.session_state.transcript_text
+    video_id = st.session_state.video_id
+
+    word_count = len(transcript_text.split())
+    st.metric("Word Count", f"{word_count:,}")
+
+    st.subheader("Transcript:")
+    st.text_area(
+        "Transcript content",
+        transcript_text,
+        height=300,
+        label_visibility="collapsed"
+    )
+
+    # Auto-save to file
+    if auto_save:
+        try:
+            filepath = save_transcript_to_file(video_id, transcript_text)
+            st.success(f"Saved to: `{filepath}`")
+        except Exception as e:
+            st.warning(f"Could not auto-save: {str(e)}")
+
+    # Download button
+    st.download_button(
+        label="⬇️ Download as TXT",
+        data=transcript_text,
+        file_name=f"{video_id}_transcript.txt",
+        mime="text/plain"
+    )
+
+    # --- AI Extraction Section ---
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_url = os.environ.get("DAILY_BRIEFING_API_URL", "").rstrip("/")
+
+    if api_key and api_url:
+        st.divider()
+        st.subheader("Extract with AI")
+
+        # Fetch available lists from Daily Briefing API
+        if st.session_state.personal_lists is None:
+            try:
+                resp = requests.get(f"{api_url}/api/personal-lists", timeout=5)
+                if resp.ok:
+                    st.session_state.personal_lists = resp.json()
+                else:
+                    st.session_state.personal_lists = []
+            except Exception:
+                st.session_state.personal_lists = []
+
+        lists = st.session_state.personal_lists
+        if not lists:
+            st.warning("No personal lists found. Create lists in the Daily Briefing app first.")
+        else:
+            # List selector
+            list_options = {
+                f"{lst.get('emoji', '')} {lst['name']}".strip(): lst
+                for lst in lists
+            }
+            selected_label = st.selectbox("Save to list:", list(list_options.keys()))
+            selected_list = list_options[selected_label]
+
+            # Extract button
+            if st.button("Extract Items", type="secondary"):
+                with st.spinner("Extracting items with AI..."):
+                    try:
+                        video_url = f"https://www.youtube.com/watch?v={video_id}"
+                        items = extract_items_from_transcript(
+                            transcript_text,
+                            selected_list["name"],
+                            video_url
+                        )
+                        st.session_state.extracted_items = items
+                    except json.JSONDecodeError:
+                        st.error("AI returned an unexpected format. Please try again.")
+                        st.session_state.extracted_items = None
+                    except Exception as e:
+                        st.error(f"Extraction failed: {str(e)}")
+                        st.session_state.extracted_items = None
+
+            # Preview and save
+            if st.session_state.extracted_items is not None:
+                items = st.session_state.extracted_items
+                if not items:
+                    st.info("No relevant items found in the transcript for this list type.")
+                else:
+                    st.write(f"Found **{len(items)}** items:")
+
+                    # Checkboxes for each item
+                    selected = []
+                    for i, item in enumerate(items):
+                        # Show first line of notes (before source URL)
+                        preview = ""
+                        if item.get("notes"):
+                            first_line = item["notes"].split("\n")[0]
+                            if first_line and not first_line.startswith("Source:"):
+                                preview = f" — {first_line}"
+                        checked = st.checkbox(
+                            f"**{item['name']}**{preview}",
+                            value=True,
+                            key=f"item_{i}"
+                        )
+                        if checked:
+                            selected.append(item)
+
+                    # Save button
+                    if selected and st.button(
+                        f"Save {len(selected)} items to {selected_list['name']}",
+                        type="primary"
+                    ):
+                        with st.spinner("Saving..."):
+                            batch = [
+                                {"content": item["name"], "notes": item.get("notes")}
+                                for item in selected
+                            ]
+                            try:
+                                resp = requests.post(
+                                    f"{api_url}/api/personal-lists/{selected_list['id']}/items/batch",
+                                    json={"items": batch},
+                                    timeout=10
+                                )
+                                if resp.ok:
+                                    st.success(f"Saved {len(selected)} items to {selected_list['name']}!")
+                                    st.session_state.extracted_items = None
+                                else:
+                                    st.error(f"Save failed (HTTP {resp.status_code})")
+                            except Exception as e:
+                                st.error(f"Save failed: {str(e)}")
 
 # Footer
 st.divider()
